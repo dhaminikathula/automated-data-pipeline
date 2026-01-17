@@ -1,0 +1,93 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_ENDPOINT: http://localhost:4566
+      BUCKET_NAME: localstack-etl-bucket
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------
+      # Start LocalStack manually
+      # -------------------------------
+      - name: Start LocalStack
+        run: |
+          docker run -d \
+            --name localstack \
+            -p 4566:4566 \
+            -e SERVICES=s3 \
+            localstack/localstack
+
+      - name: Wait for LocalStack
+        run: |
+          for i in {1..60}; do
+            if curl -s http://localhost:4566/_localstack/health | grep -q s3; then
+              echo "LocalStack ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "LocalStack failed"
+          docker logs localstack
+          exit 1
+
+      # -------------------------------
+      # Terraform
+      # -------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      # -------------------------------
+      # Verify S3 via AWS CLI
+      # -------------------------------
+      - name: Verify AWS CLI
+        run: aws --version
+
+      - name: Upload input CSV
+        run: |
+          aws --endpoint-url=$LOCALSTACK_ENDPOINT \
+            s3 cp data/raw/input.csv \
+            s3://$BUCKET_NAME/raw/input.csv
+
+      # -------------------------------
+      # ETL
+      # -------------------------------
+      - name: Build ETL Docker image
+        run: docker build -t etl-job .
+
+      - name: Run ETL job
+        run: |
+          docker run --rm \
+            --network host \
+            -e AWS_ACCESS_KEY_ID=test \
+            -e AWS_SECRET_ACCESS_KEY=test \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            -e AWS_ENDPOINT_URL=http://localhost:4566 \
+            etl-job
+
+      - name: Verify ETL output
+        run: |
+          aws --endpoint-url=$LOCALSTACK_ENDPOINT \
+            s3 ls s3://$BUCKET_NAME/processed/
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f localstack || true
